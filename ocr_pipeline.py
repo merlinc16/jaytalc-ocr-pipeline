@@ -2,6 +2,8 @@
 """
 Complete OCR Pipeline: Document AI text + Tesseract positioning + JBIG2 compression
 
+Supports both PDF and multi-page TIFF input.
+
 TRUE HYBRID APPROACH:
 - Document AI OCR for high-quality text recognition
 - Tesseract hOCR for pixel-accurate text positioning (proven to work)
@@ -64,7 +66,6 @@ def get_tiff_dimensions(tiff_path: Path) -> Tuple[int, int]:
 
 def preprocess_pdf(pdf_path: Path, work_dir: Path) -> List[Path]:
     """Convert PDF to 1-bit B&W TIFFs at 300 DPI."""
-    # Ensure absolute path
     pdf_path = Path(pdf_path).resolve()
 
     # PDF to PNG
@@ -88,6 +89,49 @@ def preprocess_pdf(pdf_path: Path, work_dir: Path) -> List[Path]:
         tiff_files.append(tiff)
 
     return tiff_files
+
+
+def preprocess_tiff(tiff_path: Path, work_dir: Path) -> List[Path]:
+    """Convert multi-page TIFF to 1-bit B&W TIFFs at 300 DPI."""
+    tiff_path = Path(tiff_path).resolve()
+
+    # Get page count
+    result = subprocess.run(
+        ["magick", "identify", str(tiff_path)],
+        capture_output=True, text=True
+    )
+    page_count = len(result.stdout.strip().split('\n'))
+
+    tiff_files = []
+    for i in range(page_count):
+        output_tiff = work_dir / f"page-{i+1:03d}.tif"
+
+        # Extract page, resize to 300 DPI letter size if needed, convert to 1-bit
+        # Using [i] to select specific page from multi-page TIFF
+        subprocess.run(
+            ["magick", f"{tiff_path}[{i}]",
+             "-density", str(DPI),
+             "-resize", "2550x3300",  # 8.5x11 at 300 DPI
+             "-auto-threshold", "otsu",
+             "-depth", "1", "-compress", "none", str(output_tiff)],
+            capture_output=True, check=True
+        )
+        tiff_files.append(output_tiff)
+
+    return tiff_files
+
+
+def preprocess_input(input_path: Path, work_dir: Path) -> List[Path]:
+    """Convert PDF or TIFF to 1-bit B&W TIFFs."""
+    input_path = Path(input_path).resolve()
+    suffix = input_path.suffix.lower()
+
+    if suffix == '.pdf':
+        return preprocess_pdf(input_path, work_dir)
+    elif suffix in ('.tif', '.tiff'):
+        return preprocess_tiff(input_path, work_dir)
+    else:
+        raise ValueError(f"Unsupported file type: {suffix}")
 
 
 def parse_hocr_bbox(title_attr: str) -> Tuple[int, int, int, int]:
@@ -438,17 +482,17 @@ def create_searchable_pdf(
     pdf.save(output_path, linearize=True, object_stream_mode=pikepdf.ObjectStreamMode.generate)
 
 
-def process_single_pdf(
-    pdf_path: Path,
+def process_single_file(
+    input_path: Path,
     output_dir: Path,
     docai_client: documentai.DocumentProcessorServiceClient,
     processor_name: str
 ) -> Tuple[bool, Path, str]:
-    """Process a single PDF through the hybrid pipeline."""
-    pdf_path = Path(pdf_path)
-    output_path = output_dir / f"{pdf_path.stem}_out.pdf"
+    """Process a single PDF or TIFF through the hybrid pipeline."""
+    input_path = Path(input_path)
+    output_path = output_dir / f"{input_path.stem}_out.pdf"
 
-    print(f"Processing: {pdf_path.name}")
+    print(f"Processing: {input_path.name}")
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -456,7 +500,7 @@ def process_single_pdf(
 
             # Step 1: Pre-process to 1-bit TIFFs
             print(f"  [1/5] Converting to 1-bit B&W TIFFs...")
-            tiff_files = preprocess_pdf(pdf_path, work_dir)
+            tiff_files = preprocess_input(input_path, work_dir)
             print(f"        {len(tiff_files)} page(s)")
 
             # Step 2: Run tesseract hOCR (for pixel-accurate positions)
@@ -492,45 +536,50 @@ def process_single_pdf(
         return False, output_path, f"{e}\n{traceback.format_exc()}"
 
 
-def process_batch(pdf_paths, output_dir, docai_client, processor_name, batch_size=4):
-    """Process PDFs in parallel."""
+def process_batch(input_paths, output_dir, docai_client, processor_name, batch_size=4):
+    """Process PDFs/TIFFs in parallel."""
     results = []
     with ThreadPoolExecutor(max_workers=batch_size) as executor:
         futures = {
-            executor.submit(process_single_pdf, pdf, output_dir, docai_client, processor_name): pdf
-            for pdf in pdf_paths
+            executor.submit(process_single_file, f, output_dir, docai_client, processor_name): f
+            for f in input_paths
         }
         for future in as_completed(futures):
-            pdf = futures[future]
+            input_file = futures[future]
             try:
-                results.append((pdf, *future.result()))
+                results.append((input_file, *future.result()))
             except Exception as e:
-                results.append((pdf, False, Path(), str(e)))
+                results.append((input_file, False, Path(), str(e)))
     return results
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Document AI OCR + hOCR alignment + JBIG2 compression'
+        description='Document AI OCR + hOCR alignment + JBIG2 compression (PDF and TIFF support)'
     )
-    parser.add_argument('files', nargs='*', help='PDF files to process')
+    parser.add_argument('files', nargs='*', help='PDF or TIFF files to process')
     parser.add_argument('--processor-id', required=True, help='Document AI processor ID')
     parser.add_argument('--output-dir', type=Path, required=True, help='Output directory')
     parser.add_argument('--batch-size', type=int, default=4, help='Parallel processes')
     parser.add_argument('--limit', type=int, default=None, help='Limit number of files')
     args = parser.parse_args()
 
-    # Find PDFs
+    # Supported extensions
+    supported_ext = ('.pdf', '.tif', '.tiff')
+
+    # Find input files
     if args.files:
-        pdfs = [Path(f) for f in args.files if f.endswith('.pdf') and not f.endswith('_out.pdf')]
+        input_files = [Path(f) for f in args.files
+                       if f.lower().endswith(supported_ext) and not f.endswith('_out.pdf')]
     else:
-        pdfs = sorted([f for f in Path('.').glob('*.pdf') if not f.name.endswith('_out.pdf')])
+        input_files = sorted([f for f in Path('.').iterdir()
+                              if f.suffix.lower() in supported_ext and not f.name.endswith('_out.pdf')])
 
     if args.limit:
-        pdfs = pdfs[:args.limit]
+        input_files = input_files[:args.limit]
 
-    if not pdfs:
-        print("No PDFs found")
+    if not input_files:
+        print("No PDF or TIFF files found")
         return 1
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -541,12 +590,15 @@ def main():
     client = documentai.DocumentProcessorServiceClient(client_options=opts)
     processor_name = client.processor_path(PROJECT_ID, LOCATION, args.processor_id)
 
+    pdf_count = sum(1 for f in input_files if f.suffix.lower() == '.pdf')
+    tiff_count = len(input_files) - pdf_count
+
     print(f"\n{'='*60}")
-    print(f"Processing {len(pdfs)} PDF(s)")
+    print(f"Processing {len(input_files)} file(s) ({pdf_count} PDF, {tiff_count} TIFF)")
     print(f"Output: {args.output_dir}")
     print(f"{'='*60}\n")
 
-    results = process_batch(pdfs, args.output_dir, client, processor_name, args.batch_size)
+    results = process_batch(input_files, args.output_dir, client, processor_name, args.batch_size)
 
     # Summary
     success = [r for r in results if r[1]]
