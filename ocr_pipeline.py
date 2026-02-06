@@ -1,24 +1,25 @@
 #!/Users/mc/jaytalc/venv/bin/python3
 """
-Complete OCR Pipeline: Document AI + hOCR alignment + JBIG2 compression
+Complete OCR Pipeline: Document AI text + Tesseract positioning + JBIG2 compression
 
-Produces ABBYY-compatible PDFs with:
-- Document AI OCR (high accuracy text recognition)
-- hOCR-based text layer (perfect text selection alignment)
-- JBIG2 compression (ABBYY-identical structure)
+TRUE HYBRID APPROACH:
+- Document AI OCR for high-quality text recognition
+- Tesseract hOCR for pixel-accurate text positioning (proven to work)
+- JBIG2 compression for ABBYY-identical output
 - Clean text extraction via pdftotext/Tika
 """
 
 import os
+import re
 import sys
 import argparse
 import subprocess
 import tempfile
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from xml.sax.saxutils import escape
+from xml.etree import ElementTree as ET
 
 import pikepdf
 from google.api_core.client_options import ClientOptions
@@ -28,8 +29,8 @@ from google.cloud import documentai_v1 as documentai
 PROJECT_ID = "toxicdocs"
 LOCATION = "us"
 DPI = 300
-PAGE_WIDTH_PX = 2550  # 8.5" * 300 DPI
-PAGE_HEIGHT_PX = 3300  # 11" * 300 DPI
+PAGE_WIDTH = 612   # PDF points (letter)
+PAGE_HEIGHT = 792
 
 
 @dataclass
@@ -43,23 +44,12 @@ class Word:
 
 
 @dataclass
-class Line:
-    """Line with words and bounding box."""
-    text: str
-    words: List[Word]
-    x1: int
-    y1: int
-    x2: int
-    y2: int
-
-
-@dataclass
 class PageOCR:
     """OCR data for a page."""
     page_num: int
-    lines: List[Line] = field(default_factory=list)
-    width: int = PAGE_WIDTH_PX
-    height: int = PAGE_HEIGHT_PX
+    words: List[Word] = field(default_factory=list)
+    width: int = 2550
+    height: int = 3300
 
 
 def get_tiff_dimensions(tiff_path: Path) -> Tuple[int, int]:
@@ -74,6 +64,9 @@ def get_tiff_dimensions(tiff_path: Path) -> Tuple[int, int]:
 
 def preprocess_pdf(pdf_path: Path, work_dir: Path) -> List[Path]:
     """Convert PDF to 1-bit B&W TIFFs at 300 DPI."""
+    # Ensure absolute path
+    pdf_path = Path(pdf_path).resolve()
+
     # PDF to PNG
     png_prefix = work_dir / "page"
     subprocess.run(
@@ -97,16 +90,54 @@ def preprocess_pdf(pdf_path: Path, work_dir: Path) -> List[Path]:
     return tiff_files
 
 
+def parse_hocr_bbox(title_attr: str) -> Tuple[int, int, int, int]:
+    """Extract bbox from hOCR title attribute."""
+    match = re.search(r'bbox\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)', title_attr)
+    if match:
+        return tuple(map(int, match.groups()))
+    return (0, 0, 0, 0)
+
+
+def run_tesseract_hocr(tiff_files: List[Path], work_dir: Path) -> List[PageOCR]:
+    """Run tesseract to get pixel-accurate word positions via hOCR."""
+    ocr_results = []
+
+    for i, tiff_file in enumerate(tiff_files):
+        hocr_base = work_dir / f"tess_{i:04d}"
+        subprocess.run(
+            ["tesseract", str(tiff_file), str(hocr_base), "-l", "eng", "hocr"],
+            capture_output=True, check=True
+        )
+
+        hocr_file = Path(f"{hocr_base}.hocr")
+        width, height = get_tiff_dimensions(tiff_file)
+        page_ocr = PageOCR(page_num=i + 1, width=width, height=height)
+
+        if hocr_file.exists():
+            tree = ET.parse(hocr_file)
+            root = tree.getroot()
+
+            for elem in root.iter():
+                if 'ocrx_word' in elem.get('class', ''):
+                    bbox = parse_hocr_bbox(elem.get('title', ''))
+                    text = ''.join(elem.itertext()).strip()
+                    if text and bbox[2] > bbox[0]:
+                        page_ocr.words.append(Word(
+                            text=text, x1=bbox[0], y1=bbox[1], x2=bbox[2], y2=bbox[3]
+                        ))
+
+        ocr_results.append(page_ocr)
+
+    return ocr_results
+
+
 def run_document_ai_ocr(
     tiff_files: List[Path],
     docai_client: documentai.DocumentProcessorServiceClient,
     processor_name: str
 ) -> List[PageOCR]:
-    """Run Document AI OCR and return structured data with line grouping and punctuation fixes."""
+    """Run Document AI OCR to get high-quality text with positions."""
     ocr_results = []
-
-    closing_punct = set('.,;:!?)]\'"')
-    opening_punct = set('(["\'')
 
     for i, tiff_file in enumerate(tiff_files):
         with open(tiff_file, "rb") as f:
@@ -119,11 +150,10 @@ def run_document_ai_ocr(
         result = docai_client.process_document(request=request)
         document = result.document
 
-        # Extract words with pixel coordinates
-        words = []
+        page_ocr = PageOCR(page_num=i + 1, width=width, height=height)
+
         for page in document.pages:
             for token in page.tokens:
-                # Get text
                 text = ""
                 if token.layout.text_anchor and token.layout.text_anchor.text_segments:
                     for seg in token.layout.text_anchor.text_segments:
@@ -134,26 +164,137 @@ def run_document_ai_ocr(
                 if not text:
                     continue
 
-                # Get bounding box in pixels
                 if token.layout.bounding_poly.normalized_vertices:
                     verts = token.layout.bounding_poly.normalized_vertices
                     x1 = int(min(v.x for v in verts) * width)
                     y1 = int(min(v.y for v in verts) * height)
                     x2 = int(max(v.x for v in verts) * width)
                     y2 = int(max(v.y for v in verts) * height)
-                    words.append(Word(text=text, x1=x1, y1=y1, x2=x2, y2=y2))
+                    page_ocr.words.append(Word(text=text, x1=x1, y1=y1, x2=x2, y2=y2))
 
-        # Group words into lines (handle multi-column layouts)
-        if not words:
-            ocr_results.append(PageOCR(page_num=i+1, width=width, height=height))
-            continue
+        ocr_results.append(page_ocr)
 
-        words.sort(key=lambda w: ((w.y1 + w.y2) / 2, w.x1))
+    return ocr_results
 
+
+def merge_ocr_data(tess_data: List[PageOCR], docai_data: List[PageOCR]) -> List[PageOCR]:
+    """
+    Merge tesseract positions with Document AI text.
+
+    For each tesseract word, find the overlapping Document AI word and use its text.
+    This gives us: tesseract's pixel-accurate positions + Document AI's superior text.
+    """
+    merged = []
+
+    for tess_page, docai_page in zip(tess_data, docai_data):
+        merged_page = PageOCR(
+            page_num=tess_page.page_num,
+            width=tess_page.width,
+            height=tess_page.height
+        )
+
+        # Build spatial index of Document AI words
+        docai_words = docai_page.words
+
+        for tess_word in tess_page.words:
+            # Find best matching Document AI word by overlap
+            best_match = None
+            best_overlap = 0
+
+            for docai_word in docai_words:
+                # Calculate overlap area
+                x_overlap = max(0, min(tess_word.x2, docai_word.x2) - max(tess_word.x1, docai_word.x1))
+                y_overlap = max(0, min(tess_word.y2, docai_word.y2) - max(tess_word.y1, docai_word.y1))
+                overlap = x_overlap * y_overlap
+
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_match = docai_word
+
+            # Use Document AI text with tesseract position
+            if best_match and best_overlap > 0:
+                merged_page.words.append(Word(
+                    text=best_match.text,  # Document AI text (better quality)
+                    x1=tess_word.x1,       # Tesseract position (pixel-accurate)
+                    y1=tess_word.y1,
+                    x2=tess_word.x2,
+                    y2=tess_word.y2
+                ))
+            else:
+                # No match found, use tesseract text as fallback
+                merged_page.words.append(tess_word)
+
+        merged.append(merged_page)
+
+    return merged
+
+
+def detect_columns(words: List[Word], page_width: int, page_height: int) -> List[List[Word]]:
+    """
+    Detect columns by analyzing word distribution.
+    For two-column layouts, splits at the center gap between columns.
+    Returns list of word lists, one per column, ordered left to right.
+    """
+    if not words or len(words) < 5:
+        return [words] if words else []
+
+    # Calculate word centers
+    centers = [(w.x1 + w.x2) / 2 for w in words]
+
+    # Check if there's a two-column layout by looking at distribution
+    page_center = page_width / 2
+    left_words = [w for w in words if (w.x1 + w.x2) / 2 < page_center * 0.95]
+    right_words = [w for w in words if (w.x1 + w.x2) / 2 > page_center * 1.05]
+
+    # If we have significant words on both sides, it's likely two columns
+    if len(left_words) > 20 and len(right_words) > 20:
+        # Find the actual boundary: max right edge of left col, min left edge of right col
+        left_max_x = max(w.x2 for w in left_words) if left_words else page_center
+        right_min_x = min(w.x1 for w in right_words) if right_words else page_center
+
+        # Boundary is middle of the gutter
+        boundary = (left_max_x + right_min_x) / 2
+
+        # Split all words by this boundary
+        left_col = [w for w in words if (w.x1 + w.x2) / 2 < boundary]
+        right_col = [w for w in words if (w.x1 + w.x2) / 2 >= boundary]
+
+        result = []
+        if left_col:
+            result.append(left_col)
+        if right_col:
+            result.append(right_col)
+        return result if result else [words]
+
+    # Single column
+    return [words]
+
+
+def group_into_lines(page_ocr: PageOCR) -> List[Tuple[str, int, int, int, int]]:
+    """
+    Group words into lines with proper column handling.
+    Processes each column separately, then outputs column by column.
+    Returns (text, x1, y1, x2, y2) tuples.
+    """
+    if not page_ocr.words:
+        return []
+
+    # First detect columns
+    columns = detect_columns(page_ocr.words, page_ocr.width, page_ocr.height)
+
+    closing_punct = set('.,;:!?)]\'"')
+    opening_punct = set('(["\'')
+    result = []
+
+    # Process each column separately
+    for column_words in columns:
+        # Sort by y center, then x within column
+        words = sorted(column_words, key=lambda w: ((w.y1 + w.y2) / 2, w.x1))
+
+        # Group into lines within this column
         lines_raw = []
         current_line = []
-        y_threshold = height * 0.012  # 1.2% of page height
-        x_gap_threshold = width * 0.15  # 15% of page width = column gap
+        y_threshold = page_ocr.height * 0.012
 
         for word in words:
             y_center = (word.y1 + word.y2) / 2
@@ -161,11 +302,7 @@ def run_document_ai_ocr(
                 current_line.append(word)
             else:
                 curr_y = (current_line[0].y1 + current_line[0].y2) / 2
-                # Check if same line AND not a column gap
-                last_word = max(current_line, key=lambda w: w.x2)
-                x_gap = word.x1 - last_word.x2
-
-                if abs(y_center - curr_y) < y_threshold and x_gap < x_gap_threshold:
+                if abs(y_center - curr_y) < y_threshold:
                     current_line.append(word)
                 else:
                     current_line.sort(key=lambda w: w.x1)
@@ -177,9 +314,7 @@ def run_document_ai_ocr(
             lines_raw.append(current_line)
 
         # Process lines with punctuation fixes
-        lines = []
         for line_words in lines_raw:
-            # Build text with punctuation handling
             text_parts = []
             for word in line_words:
                 t = word.text
@@ -197,55 +332,9 @@ def run_document_ai_ocr(
             y1 = min(w.y1 for w in line_words)
             x2 = max(w.x2 for w in line_words)
             y2 = max(w.y2 for w in line_words)
+            result.append((line_text, x1, y1, x2, y2))
 
-            lines.append(Line(text=line_text, words=line_words, x1=x1, y1=y1, x2=x2, y2=y2))
-
-        ocr_results.append(PageOCR(page_num=i+1, lines=lines, width=width, height=height))
-
-    return ocr_results
-
-
-def generate_hocr(ocr_data: List[PageOCR], work_dir: Path) -> List[Path]:
-    """Generate hOCR XML files from OCR data."""
-    hocr_files = []
-
-    for page in ocr_data:
-        hocr_path = work_dir / f"page_{page.page_num:04d}.hocr"
-
-        hocr_content = f'''<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en">
-<head>
-  <title>OCR Output</title>
-  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
-</head>
-<body>
-  <div class="ocr_page" title="bbox 0 0 {page.width} {page.height}">
-'''
-
-        for j, line in enumerate(page.lines):
-            line_bbox = f"bbox {line.x1} {line.y1} {line.x2} {line.y2}"
-            escaped_text = escape(line.text)
-            hocr_content += f'    <span class="ocr_line" title="{line_bbox}">\n'
-
-            # Add individual words for better text selection
-            for k, word in enumerate(line.words):
-                word_bbox = f"bbox {word.x1} {word.y1} {word.x2} {word.y2}"
-                escaped_word = escape(word.text)
-                hocr_content += f'      <span class="ocrx_word" title="{word_bbox}">{escaped_word}</span>\n'
-
-            hocr_content += f'    </span>\n'
-
-        hocr_content += '''  </div>
-</body>
-</html>'''
-
-        with open(hocr_path, 'w', encoding='utf-8') as f:
-            f.write(hocr_content)
-
-        hocr_files.append(hocr_path)
-
-    return hocr_files
+    return result
 
 
 def compress_to_jbig2(tiff_files: List[Path], work_dir: Path) -> Tuple[List[Path], Optional[Path]]:
@@ -264,85 +353,89 @@ def compress_to_jbig2(tiff_files: List[Path], work_dir: Path) -> Tuple[List[Path
         os.chdir(original_dir)
 
 
-def create_final_pdf(jbig2_files: List[Path], sym_file: Optional[Path],
-                     ocr_data: List[PageOCR], output_path: Path):
-    """Create final PDF with JBIG2 images and Document AI text layer."""
+def create_searchable_pdf(
+    jbig2_files: List[Path],
+    sym_file: Optional[Path],
+    ocr_data: List[PageOCR],
+    output_path: Path
+):
+    """Create PDF with JBIG2 images and positioned text layer."""
     pdf = pikepdf.Pdf.new()
 
     # Read global symbols
     globals_stream = None
-    globals_data = None
     if sym_file and sym_file.exists():
         with open(sym_file, "rb") as f:
-            globals_data = f.read()
-        globals_stream = pikepdf.Stream(pdf, globals_data)
+            globals_stream = pikepdf.Stream(pdf, f.read())
 
-    # Font for invisible text
-    font = pikepdf.Dictionary({
+    # Courier font
+    font_dict = pikepdf.Dictionary({
         "/Type": pikepdf.Name.Font,
         "/Subtype": pikepdf.Name.Type1,
-        "/BaseFont": pikepdf.Name.Helvetica,
+        "/BaseFont": pikepdf.Name.Courier,
     })
 
-    PDF_W, PDF_H = 612, 792  # Letter size in points
-
     for jbig2_file, page_ocr in zip(jbig2_files, ocr_data):
-        # Create JBIG2 image
         with open(jbig2_file, "rb") as f:
             jbig2_data = f.read()
 
-        img = pikepdf.Stream(pdf, jbig2_data)
-        img["/Type"] = pikepdf.Name.XObject
-        img["/Subtype"] = pikepdf.Name.Image
-        img["/Width"] = page_ocr.width
-        img["/Height"] = page_ocr.height
-        img["/ColorSpace"] = pikepdf.Name.DeviceGray
-        img["/BitsPerComponent"] = 1
-        img["/Filter"] = pikepdf.Name.JBIG2Decode
+        # Create JBIG2 image
+        image_stream = pikepdf.Stream(pdf, jbig2_data)
+        image_stream["/Type"] = pikepdf.Name.XObject
+        image_stream["/Subtype"] = pikepdf.Name.Image
+        image_stream["/Width"] = page_ocr.width
+        image_stream["/Height"] = page_ocr.height
+        image_stream["/ColorSpace"] = pikepdf.Name.DeviceGray
+        image_stream["/BitsPerComponent"] = 1
+        image_stream["/Filter"] = pikepdf.Name.JBIG2Decode
 
         if globals_stream:
-            img["/DecodeParms"] = pikepdf.Dictionary({"/JBIG2Globals": globals_stream})
+            image_stream["/DecodeParms"] = pikepdf.Dictionary({"/JBIG2Globals": globals_stream})
 
         # Build content stream
-        content = [f"q {PDF_W} 0 0 {PDF_H} 0 0 cm /Im0 Do Q"]
+        content_parts = [f"q {PAGE_WIDTH} 0 0 {PAGE_HEIGHT} 0 0 cm /Im0 Do Q"]
 
-        # Add text layer
-        if page_ocr.lines:
-            content.append("BT")
-            content.append("3 Tr")  # Invisible
+        # Add text layer - place each word individually for accurate selection
+        if page_ocr.words:
+            scale_x = PAGE_WIDTH / page_ocr.width
+            scale_y = PAGE_HEIGHT / page_ocr.height
 
-            scale_x = PDF_W / page_ocr.width
-            scale_y = PDF_H / page_ocr.height
+            content_parts.append("BT")
+            content_parts.append("3 Tr")  # Invisible
 
-            for line in page_ocr.lines:
-                # Position at line start, baseline at bottom of bbox
-                pdf_x = line.x1 * scale_x
-                pdf_y = PDF_H - (line.y2 * scale_y)
+            for word in page_ocr.words:
+                text = word.text
+                if not text:
+                    continue
 
-                # Font size from line height
-                line_h = (line.y2 - line.y1) * scale_y
-                font_size = max(4, min(line_h * 0.8, 72))
+                pdf_x = word.x1 * scale_x
+                pdf_y = PAGE_HEIGHT - (word.y2 * scale_y)  # Flip Y, use bottom of box
+                word_width = (word.x2 - word.x1) * scale_x
+                word_height = (word.y2 - word.y1) * scale_y
 
-                # Escape text
-                text = line.text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+                font_size = max(1, min(word_height * 0.85, 72))
+                natural_width = len(text) * font_size * 0.6
+                h_scale = (word_width / natural_width * 100) if natural_width > 0 else 100
 
-                content.append(f"/F1 {font_size:.1f} Tf")
-                content.append(f"1 0 0 1 {pdf_x:.2f} {pdf_y:.2f} Tm")
-                content.append(f"({text}) Tj")
+                escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
-            content.append("ET")
+                content_parts.append(f"/F1 {font_size:.2f} Tf")
+                content_parts.append(f"{h_scale:.1f} Tz")
+                content_parts.append(f"1 0 0 1 {pdf_x:.2f} {pdf_y:.2f} Tm")
+                content_parts.append(f"({escaped}) Tj")
 
-        # Create page
-        pdf.add_blank_page(page_size=(PDF_W, PDF_H))
+            content_parts.append("ET")
+
+        # Add page
+        pdf.add_blank_page(page_size=(PAGE_WIDTH, PAGE_HEIGHT))
         page = pdf.pages[-1]
-        page.Contents = pikepdf.Stream(pdf, "\n".join(content).encode())
+        page.Contents = pikepdf.Stream(pdf, "\n".join(content_parts).encode())
         page.Resources = pikepdf.Dictionary({
-            "/XObject": pikepdf.Dictionary({"/Im0": img}),
-            "/Font": pikepdf.Dictionary({"/F1": font}),
+            "/XObject": pikepdf.Dictionary({"/Im0": image_stream}),
+            "/Font": pikepdf.Dictionary({"/F1": font_dict}),
         })
 
     pdf.save(output_path, linearize=True, object_stream_mode=pikepdf.ObjectStreamMode.generate)
-    pdf.close()
 
 
 def process_single_pdf(
@@ -351,7 +444,7 @@ def process_single_pdf(
     docai_client: documentai.DocumentProcessorServiceClient,
     processor_name: str
 ) -> Tuple[bool, Path, str]:
-    """Process a single PDF through the complete pipeline."""
+    """Process a single PDF through the hybrid pipeline."""
     pdf_path = Path(pdf_path)
     output_path = output_dir / f"{pdf_path.stem}_out.pdf"
 
@@ -366,19 +459,26 @@ def process_single_pdf(
             tiff_files = preprocess_pdf(pdf_path, work_dir)
             print(f"        {len(tiff_files)} page(s)")
 
-            # Step 2: Document AI OCR
-            print(f"  [2/5] Running Document AI OCR...")
-            ocr_data = run_document_ai_ocr(tiff_files, docai_client, processor_name)
-            total_words = sum(len(line.words) for page in ocr_data for line in page.lines)
-            print(f"        {total_words} words extracted")
+            # Step 2: Run tesseract hOCR (for pixel-accurate positions)
+            print(f"  [2/5] Running tesseract for positions...")
+            tess_data = run_tesseract_hocr(tiff_files, work_dir)
+            tess_words = sum(len(p.words) for p in tess_data)
+            print(f"        {tess_words} positions found")
 
-            # Step 3: JBIG2 compression
-            print(f"  [3/4] Compressing to JBIG2...")
+            # Step 3: Run Document AI OCR (for high-quality text)
+            print(f"  [3/5] Running Document AI for text...")
+            docai_data = run_document_ai_ocr(tiff_files, docai_client, processor_name)
+            docai_words = sum(len(p.words) for p in docai_data)
+            print(f"        {docai_words} words recognized")
+
+            # Step 4: Merge - tesseract positions + Document AI text
+            print(f"  [4/5] Merging OCR data...")
+            merged_data = merge_ocr_data(tess_data, docai_data)
+
+            # Step 5: JBIG2 compression
+            print(f"  [5/5] Creating JBIG2 PDF...")
             jbig2_files, sym_file = compress_to_jbig2(tiff_files, work_dir)
-
-            # Step 4: Create final PDF
-            print(f"  [4/4] Creating searchable PDF...")
-            create_final_pdf(jbig2_files, sym_file, ocr_data, output_path)
+            create_searchable_pdf(jbig2_files, sym_file, merged_data, output_path)
 
             in_kb = pdf_path.stat().st_size / 1024
             out_kb = output_path.stat().st_size / 1024
