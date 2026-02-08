@@ -26,6 +26,7 @@ from xml.etree import ElementTree as ET
 import pikepdf
 from google.api_core.client_options import ClientOptions
 from google.cloud import documentai_v1 as documentai
+from openai import OpenAI
 
 # Configuration
 PROJECT_ID = "toxicdocs"
@@ -273,45 +274,153 @@ def merge_ocr_data(tess_data: List[PageOCR], docai_data: List[PageOCR]) -> List[
     return merged
 
 
+def postprocess_ocr_with_llm(ocr_data: List[PageOCR], openai_client: OpenAI) -> List[PageOCR]:
+    """
+    Use GPT-4o-mini to fix common OCR errors while preserving word positions.
+    Processes page by page, sending words in reading order.
+    """
+    if not openai_client:
+        return ocr_data
+
+    corrected = []
+
+    for page in ocr_data:
+        if not page.words:
+            corrected.append(page)
+            continue
+
+        # Build text with word indices for mapping back
+        words_text = [w.text for w in page.words]
+        original_text = " ".join(words_text)
+
+        # Skip if too few words
+        if len(words_text) < 5:
+            corrected.append(page)
+            continue
+
+        try:
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """You are an OCR error correction assistant. Fix common OCR errors in the text while preserving the exact word count and order.
+
+Common OCR errors to fix:
+- "rn" misread as "m" or vice versa (e.g., "bum" → "burn", "modem" → "modern")
+- "l" confused with "1" or "I"
+- "0" confused with "O"
+- "cl" misread as "d"
+- Split words that should be joined
+- Joined words that should be split (maintain word count by using hyphens if needed)
+- Obvious misspellings from character confusion
+
+CRITICAL: You must return EXACTLY the same number of words as the input. Do not add or remove words. If unsure, keep the original word."""
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Fix OCR errors in this text ({len(words_text)} words). Return exactly {len(words_text)} words:\n\n{original_text}"
+                    }
+                ],
+                temperature=0.1,
+                max_tokens=min(len(original_text) * 2, 16000)
+            )
+
+            corrected_text = response.choices[0].message.content.strip()
+            corrected_words = corrected_text.split()
+
+            # Only use correction if word count matches
+            if len(corrected_words) == len(words_text):
+                new_page = PageOCR(
+                    page_num=page.page_num,
+                    width=page.width,
+                    height=page.height
+                )
+                for i, word in enumerate(page.words):
+                    new_page.words.append(Word(
+                        text=corrected_words[i],
+                        x1=word.x1,
+                        y1=word.y1,
+                        x2=word.x2,
+                        y2=word.y2
+                    ))
+                corrected.append(new_page)
+            else:
+                # Word count mismatch, use original
+                corrected.append(page)
+
+        except Exception as e:
+            print(f"    Warning: LLM post-processing failed for page {page.page_num}: {e}")
+            corrected.append(page)
+
+    return corrected
+
+
 def detect_columns(words: List[Word], page_width: int, page_height: int) -> List[List[Word]]:
     """
-    Detect columns by analyzing word distribution.
-    For two-column layouts, splits at the center gap between columns.
+    Detect multiple columns by finding vertical gaps in word positions.
+    Uses histogram analysis to find gutters between columns.
     Returns list of word lists, one per column, ordered left to right.
     """
     if not words or len(words) < 5:
         return [words] if words else []
 
-    # Calculate word centers
-    centers = [(w.x1 + w.x2) / 2 for w in words]
+    # Build histogram of word coverage across X axis
+    # Each bin represents a small horizontal slice
+    num_bins = 100
+    bin_width = page_width / num_bins
+    histogram = [0] * num_bins
 
-    # Check if there's a two-column layout by looking at distribution
-    page_center = page_width / 2
-    left_words = [w for w in words if (w.x1 + w.x2) / 2 < page_center * 0.95]
-    right_words = [w for w in words if (w.x1 + w.x2) / 2 > page_center * 1.05]
+    for word in words:
+        start_bin = int(word.x1 / bin_width)
+        end_bin = int(word.x2 / bin_width)
+        for b in range(max(0, start_bin), min(num_bins, end_bin + 1)):
+            histogram[b] += 1
 
-    # If we have significant words on both sides, it's likely two columns
-    if len(left_words) > 20 and len(right_words) > 20:
-        # Find the actual boundary: max right edge of left col, min left edge of right col
-        left_max_x = max(w.x2 for w in left_words) if left_words else page_center
-        right_min_x = min(w.x1 for w in right_words) if right_words else page_center
+    # Find gaps (bins with zero or very low coverage)
+    # These represent gutters between columns
+    threshold = max(histogram) * 0.05  # Gaps have < 5% of max coverage
 
-        # Boundary is middle of the gutter
-        boundary = (left_max_x + right_min_x) / 2
+    # Find continuous regions of low coverage (gutters)
+    gutters = []
+    in_gutter = False
+    gutter_start = 0
 
-        # Split all words by this boundary
-        left_col = [w for w in words if (w.x1 + w.x2) / 2 < boundary]
-        right_col = [w for w in words if (w.x1 + w.x2) / 2 >= boundary]
+    for i, count in enumerate(histogram):
+        if count <= threshold:
+            if not in_gutter:
+                in_gutter = True
+                gutter_start = i
+        else:
+            if in_gutter:
+                gutter_end = i
+                # Only count as gutter if it's wide enough (at least 2% of page)
+                if gutter_end - gutter_start >= 2:
+                    gutter_center = (gutter_start + gutter_end) / 2 * bin_width
+                    # Don't count gutters at page edges
+                    if gutter_center > page_width * 0.05 and gutter_center < page_width * 0.95:
+                        gutters.append(gutter_center)
+                in_gutter = False
 
-        result = []
-        if left_col:
-            result.append(left_col)
-        if right_col:
-            result.append(right_col)
-        return result if result else [words]
+    # If no gutters found, return single column
+    if not gutters:
+        return [words]
 
-    # Single column
-    return [words]
+    # Sort gutters and use them as column boundaries
+    gutters.sort()
+
+    # Create columns based on boundaries
+    boundaries = [0] + gutters + [page_width]
+    columns = []
+
+    for i in range(len(boundaries) - 1):
+        left_bound = boundaries[i]
+        right_bound = boundaries[i + 1]
+        col_words = [w for w in words if left_bound <= (w.x1 + w.x2) / 2 < right_bound]
+        if col_words:
+            columns.append(col_words)
+
+    return columns if columns else [words]
 
 
 def group_into_lines(page_ocr: PageOCR) -> List[Tuple[str, int, int, int, int]]:
@@ -486,11 +595,15 @@ def process_single_file(
     input_path: Path,
     output_dir: Path,
     docai_client: documentai.DocumentProcessorServiceClient,
-    processor_name: str
+    processor_name: str,
+    openai_client: Optional[OpenAI] = None
 ) -> Tuple[bool, Path, str]:
     """Process a single PDF or TIFF through the hybrid pipeline."""
     input_path = Path(input_path)
     output_path = output_dir / f"{input_path.stem}_out.pdf"
+
+    use_llm = openai_client is not None
+    total_steps = 6 if use_llm else 5
 
     print(f"Processing: {input_path.name}")
 
@@ -499,32 +612,39 @@ def process_single_file(
             work_dir = Path(temp_dir)
 
             # Step 1: Pre-process to 1-bit TIFFs
-            print(f"  [1/5] Converting to 1-bit B&W TIFFs...")
+            print(f"  [1/{total_steps}] Converting to 1-bit B&W TIFFs...")
             tiff_files = preprocess_input(input_path, work_dir)
             print(f"        {len(tiff_files)} page(s)")
 
             # Step 2: Run tesseract hOCR (for pixel-accurate positions)
-            print(f"  [2/5] Running tesseract for positions...")
+            print(f"  [2/{total_steps}] Running tesseract for positions...")
             tess_data = run_tesseract_hocr(tiff_files, work_dir)
             tess_words = sum(len(p.words) for p in tess_data)
             print(f"        {tess_words} positions found")
 
             # Step 3: Run Document AI OCR (for high-quality text)
-            print(f"  [3/5] Running Document AI for text...")
+            print(f"  [3/{total_steps}] Running Document AI for text...")
             docai_data = run_document_ai_ocr(tiff_files, docai_client, processor_name)
             docai_words = sum(len(p.words) for p in docai_data)
             print(f"        {docai_words} words recognized")
 
             # Step 4: Merge - tesseract positions + Document AI text
-            print(f"  [4/5] Merging OCR data...")
+            print(f"  [4/{total_steps}] Merging OCR data...")
             merged_data = merge_ocr_data(tess_data, docai_data)
 
-            # Step 5: JBIG2 compression
-            print(f"  [5/5] Creating JBIG2 PDF...")
+            # Step 5 (optional): LLM post-processing
+            if use_llm:
+                print(f"  [5/{total_steps}] LLM error correction (GPT-4o-mini)...")
+                merged_data = postprocess_ocr_with_llm(merged_data, openai_client)
+                print(f"        {sum(len(p.words) for p in merged_data)} words corrected")
+
+            # Step 5/6: JBIG2 compression
+            step_num = 6 if use_llm else 5
+            print(f"  [{step_num}/{total_steps}] Creating JBIG2 PDF...")
             jbig2_files, sym_file = compress_to_jbig2(tiff_files, work_dir)
             create_searchable_pdf(jbig2_files, sym_file, merged_data, output_path)
 
-            in_kb = pdf_path.stat().st_size / 1024
+            in_kb = input_path.stat().st_size / 1024
             out_kb = output_path.stat().st_size / 1024
             pct = (1 - out_kb / in_kb) * 100
             print(f"        {in_kb:.1f} KB -> {out_kb:.1f} KB ({pct:.1f}% reduction)")
@@ -536,12 +656,12 @@ def process_single_file(
         return False, output_path, f"{e}\n{traceback.format_exc()}"
 
 
-def process_batch(input_paths, output_dir, docai_client, processor_name, batch_size=4):
+def process_batch(input_paths, output_dir, docai_client, processor_name, openai_client=None, batch_size=4):
     """Process PDFs/TIFFs in parallel."""
     results = []
     with ThreadPoolExecutor(max_workers=batch_size) as executor:
         futures = {
-            executor.submit(process_single_file, f, output_dir, docai_client, processor_name): f
+            executor.submit(process_single_file, f, output_dir, docai_client, processor_name, openai_client): f
             for f in input_paths
         }
         for future in as_completed(futures):
@@ -562,6 +682,8 @@ def main():
     parser.add_argument('--output-dir', type=Path, required=True, help='Output directory')
     parser.add_argument('--batch-size', type=int, default=4, help='Parallel processes')
     parser.add_argument('--limit', type=int, default=None, help='Limit number of files')
+    parser.add_argument('--llm-postprocess', action='store_true',
+                        help='Use GPT-4o-mini to fix OCR errors (requires OPENAI_API_KEY)')
     args = parser.parse_args()
 
     # Supported extensions
@@ -590,6 +712,16 @@ def main():
     client = documentai.DocumentProcessorServiceClient(client_options=opts)
     processor_name = client.processor_path(PROJECT_ID, LOCATION, args.processor_id)
 
+    # Initialize OpenAI client if LLM post-processing enabled
+    openai_client = None
+    if args.llm_postprocess:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            print("Error: --llm-postprocess requires OPENAI_API_KEY environment variable")
+            return 1
+        openai_client = OpenAI(api_key=api_key)
+        print(f"LLM post-processing: enabled (GPT-4o-mini)")
+
     pdf_count = sum(1 for f in input_files if f.suffix.lower() == '.pdf')
     tiff_count = len(input_files) - pdf_count
 
@@ -598,7 +730,7 @@ def main():
     print(f"Output: {args.output_dir}")
     print(f"{'='*60}\n")
 
-    results = process_batch(input_files, args.output_dir, client, processor_name, args.batch_size)
+    results = process_batch(input_files, args.output_dir, client, processor_name, openai_client, args.batch_size)
 
     # Summary
     success = [r for r in results if r[1]]
