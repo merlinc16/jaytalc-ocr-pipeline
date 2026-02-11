@@ -1,0 +1,16 @@
+# PDFs (input files)
+*.pdf
+
+# Output and work directories
+output/
+work_*/
+
+# Python
+__pycache__/
+venv/
+
+# Keys and credentials
+*.pem
+
+# macOS
+.DS_Store
